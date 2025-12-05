@@ -17,6 +17,18 @@ mod clauses;
 mod expr;
 mod simple_executor;
 
+/// Execution strategy for Cypher queries
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionStrategy {
+    /// Use DataFusion query planner (default, full feature support)
+    #[default]
+    DataFusion,
+    /// Use simple single-table executor (legacy, limited features)
+    Simple,
+    /// Use Lance native executor (not yet implemented)
+    LanceNative,
+}
+
 /// A Cypher query that can be executed against Lance datasets
 #[derive(Debug, Clone)]
 pub struct CypherQuery {
@@ -92,21 +104,21 @@ impl CypherQuery {
         })
     }
 
-    /// Execute using the DataFusion planner with in-memory datasets
+    /// Execute the query against provided in-memory datasets
     ///
-    /// # Overview
-    /// This convenience method creates both a catalog and session context from the provided
-    /// in-memory RecordBatches. It's ideal for testing and small datasets that fit in memory.
-    ///
-    /// For production use with external data sources (CSV, Parquet, databases), use
-    /// `execute_with_datafusion_context` instead, which automatically builds the catalog
-    /// from the SessionContext.
+    /// This method uses the DataFusion planner by default for comprehensive query support
+    /// including joins, aggregations, and complex patterns. You can optionally specify
+    /// a different execution strategy.
     ///
     /// # Arguments
     /// * `datasets` - HashMap of table name to RecordBatch (nodes and relationships)
+    /// * `strategy` - Optional execution strategy (defaults to DataFusion)
     ///
     /// # Returns
     /// A single RecordBatch containing the query results
+    ///
+    /// # Errors
+    /// Returns error if query parsing, planning, or execution fails
     ///
     /// # Example
     /// ```ignore
@@ -122,12 +134,66 @@ impl CypherQuery {
     /// // Parse and execute query
     /// let query = CypherQuery::parse("MATCH (p:Person)-[:KNOWS]->(f) RETURN p.name, f.name")?
     ///     .with_config(config);
-    /// let result = query.execute_datafusion(datasets).await?;
+    /// // Use the default DataFusion strategy
+    /// let result = query.execute(datasets, None).await?;
+    /// // Use the Simple strategy explicitly
+    /// let result = query.execute(datasets, Some(ExecutionStrategy::Simple)).await?;
     /// ```
-    pub async fn execute_datafusion(
+    pub async fn execute(
         &self,
         datasets: HashMap<String, arrow::record_batch::RecordBatch>,
+        strategy: Option<ExecutionStrategy>,
     ) -> Result<arrow::record_batch::RecordBatch> {
+        let strategy = strategy.unwrap_or_default();
+        match strategy {
+            ExecutionStrategy::DataFusion => self.execute_datafusion(datasets).await,
+            ExecutionStrategy::Simple => self.execute_simple(datasets).await,
+            ExecutionStrategy::LanceNative => Err(GraphError::UnsupportedFeature {
+                feature: "Lance native execution strategy is not yet implemented".to_string(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            }),
+        }
+    }
+
+    /// Explain the query execution plan using in-memory datasets
+    ///
+    /// Returns a formatted string showing the query execution plan at different stages:
+    /// - Graph Logical Plan (graph-specific operators)
+    /// - DataFusion Logical Plan (optimized relational plan)
+    /// - DataFusion Physical Plan (execution plan with optimizations)
+    ///
+    /// This is useful for understanding query performance, debugging, and optimization.
+    ///
+    /// # Arguments
+    /// * `datasets` - HashMap of table name to RecordBatch (nodes and relationships)
+    ///
+    /// # Returns
+    /// A formatted string containing the execution plan at multiple levels
+    ///
+    /// # Errors
+    /// Returns error if planning fails
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::collections::HashMap;
+    /// use arrow::record_batch::RecordBatch;
+    /// use lance_graph::query::CypherQuery;
+    ///
+    /// // Create in-memory datasets
+    /// let mut datasets = HashMap::new();
+    /// datasets.insert("Person".to_string(), person_batch);
+    /// datasets.insert("KNOWS".to_string(), knows_batch);
+    ///
+    /// let query = CypherQuery::parse("MATCH (p:Person) WHERE p.age > 30 RETURN p.name")?
+    ///     .with_config(config);
+    ///
+    /// let plan = query.explain(datasets).await?;
+    /// println!("{}", plan);
+    /// ```
+    pub async fn explain(
+        &self,
+        datasets: HashMap<String, arrow::record_batch::RecordBatch>,
+    ) -> Result<String> {
         use std::sync::Arc;
 
         // Build catalog and context from datasets
@@ -135,9 +201,8 @@ impl CypherQuery {
             .build_catalog_and_context_from_datasets(datasets)
             .await?;
 
-        // Delegate to common execution logic
-        self.execute_with_catalog_and_context(Arc::new(catalog), ctx)
-            .await
+        // Delegate to the internal explain method
+        self.explain_internal(Arc::new(catalog), ctx).await
     }
 
     /// Execute query with a DataFusion SessionContext, automatically building the catalog
@@ -181,14 +246,14 @@ impl CypherQuery {
     /// // Step 3: Execute query (catalog is built automatically)
     /// let query = CypherQuery::parse("MATCH (p:Person)-[:KNOWS]->(f) RETURN p.name")?
     ///     .with_config(config);
-    /// let result = query.execute_with_datafusion_context(ctx).await?;
+    /// let result = query.execute_with_context(ctx).await?;
     /// ```
     ///
     /// # Note
     /// The catalog is built by querying the SessionContext for schemas of tables
     /// mentioned in the GraphConfig. Table names must match between GraphConfig
     /// (node labels/relationship types) and SessionContext (registered table names).
-    pub async fn execute_with_datafusion_context(
+    pub async fn execute_with_context(
         &self,
         ctx: datafusion::execution::context::SessionContext,
     ) -> Result<arrow::record_batch::RecordBatch> {
@@ -318,45 +383,25 @@ impl CypherQuery {
         })
     }
 
-    /// Explain the query execution plan using in-memory datasets
+    /// Execute using the DataFusion planner with in-memory datasets
     ///
-    /// Returns a formatted string showing the query execution plan at different stages:
-    /// - Graph Logical Plan (graph-specific operators)
-    /// - DataFusion Logical Plan (optimized relational plan)
-    /// - DataFusion Physical Plan (execution plan with optimizations)
+    /// # Overview
+    /// This convenience method creates both a catalog and session context from the provided
+    /// in-memory RecordBatches. It's ideal for testing and small datasets that fit in memory.
     ///
-    /// This is useful for understanding query performance, debugging, and optimization.
+    /// For production use with external data sources (CSV, Parquet, databases), use
+    /// `execute_with_context` instead, which automatically builds the catalog
+    /// from the SessionContext.
     ///
     /// # Arguments
     /// * `datasets` - HashMap of table name to RecordBatch (nodes and relationships)
     ///
     /// # Returns
-    /// A formatted string containing the execution plan at multiple levels
-    ///
-    /// # Errors
-    /// Returns error if planning fails
-    ///
-    /// # Example
-    /// ```ignore
-    /// use std::collections::HashMap;
-    /// use arrow::record_batch::RecordBatch;
-    /// use lance_graph::query::CypherQuery;
-    ///
-    /// // Create in-memory datasets
-    /// let mut datasets = HashMap::new();
-    /// datasets.insert("Person".to_string(), person_batch);
-    /// datasets.insert("KNOWS".to_string(), knows_batch);
-    ///
-    /// let query = CypherQuery::parse("MATCH (p:Person) WHERE p.age > 30 RETURN p.name")?
-    ///     .with_config(config);
-    ///
-    /// let plan = query.explain_datafusion(datasets).await?;
-    /// println!("{}", plan);
-    /// ```
-    pub async fn explain_datafusion(
+    /// A single RecordBatch containing the query results
+    async fn execute_datafusion(
         &self,
         datasets: HashMap<String, arrow::record_batch::RecordBatch>,
-    ) -> Result<String> {
+    ) -> Result<arrow::record_batch::RecordBatch> {
         use std::sync::Arc;
 
         // Build catalog and context from datasets
@@ -364,8 +409,9 @@ impl CypherQuery {
             .build_catalog_and_context_from_datasets(datasets)
             .await?;
 
-        // Delegate to the internal explain method
-        self.explain_internal(Arc::new(catalog), ctx).await
+        // Delegate to common execution logic
+        self.execute_with_catalog_and_context(Arc::new(catalog), ctx)
+            .await
     }
 
     /// Helper to build catalog and context from in-memory datasets
@@ -599,30 +645,6 @@ impl CypherQuery {
         output.push('\n');
 
         Ok(output)
-    }
-
-    /// Execute the query against provided in-memory datasets using the DataFusion planner
-    ///
-    /// This is the primary execution method that uses the full DataFusion-based planner
-    /// for comprehensive query support including joins, aggregations, and complex patterns.
-    ///
-    /// For legacy single-table queries, use `execute_simple()` instead.
-    pub async fn execute(
-        &self,
-        datasets: HashMap<String, arrow::record_batch::RecordBatch>,
-    ) -> Result<arrow::record_batch::RecordBatch> {
-        self.execute_datafusion(datasets).await
-    }
-
-    /// Explain the query execution plan using the DataFusion planner
-    ///
-    /// This method provides a high-level overview of the query execution plan
-    /// using the DataFusion planner, which is useful for debugging and optimization.
-    pub async fn explain(
-        &self,
-        datasets: HashMap<String, arrow::record_batch::RecordBatch>,
-    ) -> Result<String> {
-        self.explain_datafusion(datasets).await
     }
 
     /// Execute simple single-table queries (legacy implementation)
@@ -1564,7 +1586,7 @@ mod tests {
             .with_config(cfg);
 
         // Execute with context (catalog built automatically)
-        let result = query.execute_with_datafusion_context(ctx).await.unwrap();
+        let result = query.execute_with_context(ctx).await.unwrap();
 
         // Verify results
         assert_eq!(result.num_rows(), 3);
@@ -1621,7 +1643,7 @@ mod tests {
             .with_config(cfg);
 
         // Execute with context
-        let result = query.execute_with_datafusion_context(ctx).await.unwrap();
+        let result = query.execute_with_context(ctx).await.unwrap();
 
         // Verify: should return Bob (34) and David (42)
         assert_eq!(result.num_rows(), 2);
@@ -1708,7 +1730,7 @@ mod tests {
             .with_config(cfg);
 
         // Execute with context
-        let result = query.execute_with_datafusion_context(ctx).await.unwrap();
+        let result = query.execute_with_context(ctx).await.unwrap();
 
         // Verify: should return 2 relationships (Alice->Bob, Bob->Carol)
         assert_eq!(result.num_rows(), 2);
@@ -1781,7 +1803,7 @@ mod tests {
         .with_config(cfg);
 
         // Execute with context
-        let result = query.execute_with_datafusion_context(ctx).await.unwrap();
+        let result = query.execute_with_context(ctx).await.unwrap();
 
         // Verify: should return top 2 scores (David: 95, Bob: 92)
         assert_eq!(result.num_rows(), 2);

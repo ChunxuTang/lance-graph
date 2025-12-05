@@ -22,7 +22,8 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 use lance_graph::{
-    CypherQuery as RustCypherQuery, GraphConfig as RustGraphConfig, GraphError as RustGraphError,
+    ExecutionStrategy as RustExecutionStrategy, CypherQuery as RustCypherQuery,
+    GraphConfig as RustGraphConfig, GraphError as RustGraphError,
 };
 use pyo3::{
     exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError},
@@ -33,6 +34,28 @@ use pyo3::{
 use serde_json::Value as JsonValue;
 
 use crate::RT;
+
+/// Execution strategy for Cypher queries
+#[pyclass(name = "ExecutionStrategy", module = "lance.graph")]
+#[derive(Clone, Copy)]
+pub enum ExecutionStrategy {
+    /// Use DataFusion query planner (default, full feature support)
+    DataFusion,
+    /// Use simple single-table executor (legacy, limited features)
+    Simple,
+    /// Use Lance native executor (not yet implemented)
+    LanceNative,
+}
+
+impl From<ExecutionStrategy> for RustExecutionStrategy {
+    fn from(strategy: ExecutionStrategy) -> Self {
+        match strategy {
+            ExecutionStrategy::DataFusion => RustExecutionStrategy::DataFusion,
+            ExecutionStrategy::Simple => RustExecutionStrategy::Simple,
+            ExecutionStrategy::LanceNative => RustExecutionStrategy::LanceNative,
+        }
+    }
+}
 
 /// Convert GraphError to PyErr
 fn graph_error_to_pyerr(err: RustGraphError) -> PyErr {
@@ -267,6 +290,8 @@ impl CypherQuery {
     /// ----------
     /// datasets : dict
     ///     Dictionary mapping table names to Lance datasets
+    /// strategy : ExecutionStrategy, optional
+    ///     Execution strategy to use (defaults to DataFusion)
     ///
     /// Returns
     /// -------
@@ -277,56 +302,40 @@ impl CypherQuery {
     /// ------
     /// RuntimeError
     ///     If query execution fails
-    fn execute(&self, py: Python, datasets: &Bound<'_, PyDict>) -> PyResult<PyObject> {
-        // Convert datasets to Arrow batches while holding the GIL - same as before
+    ///
+    /// Examples
+    /// --------
+    /// >>> # Default strategy (DataFusion)
+    /// >>> result = query.execute(datasets)
+    ///
+    /// >>> # Explicit strategy
+    /// >>> from lance.graph import ExecutionStrategy
+    /// >>> result = query.execute(datasets, strategy=ExecutionStrategy.Simple)
+    #[pyo3(signature = (datasets, strategy=None))]
+    fn execute(
+        &self,
+        py: Python,
+        datasets: &Bound<'_, PyDict>,
+        strategy: Option<ExecutionStrategy>,
+    ) -> PyResult<PyObject> {
+        // Convert datasets to Arrow batches while holding the GIL
         let arrow_datasets = python_datasets_to_batches(datasets)?;
+
+        // Convert Python strategy to Rust strategy
+        let rust_strategy = strategy.map(|s| s.into());
 
         // Clone the inner query for use in the async block
         let inner_query = self.inner.clone();
 
         // Use RT.block_on with Some(py) like the scanner to_pyarrow method
         let result_batch = RT
-            .block_on(Some(py), inner_query.execute(arrow_datasets))?
+            .block_on(Some(py), inner_query.execute(arrow_datasets, rust_strategy))?
             .map_err(graph_error_to_pyerr)?;
 
         record_batch_to_python_table(py, &result_batch)
     }
 
-    /// Execute query using the DataFusion planner with in-memory datasets
-    ///
-    /// Parameters
-    /// ----------
-    /// datasets : dict
-    ///     Dictionary mapping table names to in-memory tables (pyarrow.Table, LanceDataset, etc.)
-    ///     Keys should match node labels and relationship types in the graph config.
-    ///
-    /// Returns
-    /// -------
-    /// pyarrow.Table
-    ///     Query results as Arrow table
-    ///
-    /// Raises
-    /// ------
-    /// ValueError
-    ///     If the query is invalid or datasets are missing
-    /// RuntimeError
-    ///     If query execution fails
-    fn execute_datafusion(&self, py: Python, datasets: &Bound<'_, PyDict>) -> PyResult<PyObject> {
-        // Convert datasets to Arrow RecordBatch map
-        let arrow_datasets = python_datasets_to_batches(datasets)?;
-
-        // Clone for async move
-        let inner_query = self.inner.clone();
-
-        // Execute via runtime
-        let result_batch = RT
-            .block_on(Some(py), inner_query.execute_datafusion(arrow_datasets))?
-            .map_err(graph_error_to_pyerr)?;
-
-        record_batch_to_python_table(py, &result_batch)
-    }
-
-    /// Explain query uusing the DataFusion planner with in-memory datasets
+    /// Explain query using the DataFusion planner with in-memory datasets
     ///
     /// Parameters
     /// ----------
@@ -345,7 +354,7 @@ impl CypherQuery {
     ///     If the query is invalid or datasets are missing
     /// RuntimeError
     ///     If query explain fails
-    fn explain_datafusion(&self, py: Python, datasets: &Bound<'_, PyDict>) -> PyResult<String> {
+    fn explain(&self, py: Python, datasets: &Bound<'_, PyDict>) -> PyResult<String> {
         // Convert datasets to Arrow RecordBatch map
         let arrow_datasets = python_datasets_to_batches(datasets)?;
 
@@ -354,7 +363,7 @@ impl CypherQuery {
 
         // Execute via runtime
         let plan = RT
-            .block_on(Some(py), inner_query.explain_datafusion(arrow_datasets))?
+            .block_on(Some(py), inner_query.explain(arrow_datasets))?
             .map_err(graph_error_to_pyerr)?;
 
         Ok(plan)
@@ -562,6 +571,7 @@ fn record_batch_to_python_table(
 pub fn register_graph_module(py: Python, parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     let graph_module = PyModule::new(py, "graph")?;
 
+    graph_module.add_class::<ExecutionStrategy>()?;
     graph_module.add_class::<GraphConfig>()?;
     graph_module.add_class::<GraphConfigBuilder>()?;
     graph_module.add_class::<CypherQuery>()?;
