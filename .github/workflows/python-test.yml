@@ -78,12 +78,13 @@ jobs:
           python-version: "3.11"
       - name: Install uv
         uses: astral-sh/setup-uv@v3
-      - name: Install dependencies
+      - name: Install linting tools
         working-directory: python
         run: |
           uv venv
           source .venv/bin/activate
-          uv pip install -e .[dev]
+          # Install only linting tools without building the Rust extension
+          uv pip install ruff pyright
       - name: Run ruff format check
         working-directory: python
         run: |
