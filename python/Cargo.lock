@@ -3430,7 +3430,7 @@ dependencies = [
 
 [[package]]
 name = "lance-graph"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3451,7 +3451,7 @@ dependencies = [
 
 [[package]]
 name = "lance-graph-python"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "arrow-array",
