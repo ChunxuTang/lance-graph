@@ -4,6 +4,7 @@
 //! High-level Cypher query interface for Lance datasets
 
 use crate::ast::CypherQuery as CypherAST;
+use crate::ast::ReadingClause;
 use crate::config::GraphConfig;
 use crate::error::{GraphError, Result};
 use crate::logical_plan::LogicalPlanner;
@@ -1016,9 +1017,11 @@ impl CypherQuery {
     pub fn referenced_node_labels(&self) -> Vec<String> {
         let mut labels = Vec::new();
 
-        for match_clause in &self.ast.match_clauses {
-            for pattern in &match_clause.patterns {
-                self.collect_node_labels_from_pattern(pattern, &mut labels);
+        for clause in &self.ast.reading_clauses {
+            if let ReadingClause::Match(match_clause) = clause {
+                for pattern in &match_clause.patterns {
+                    self.collect_node_labels_from_pattern(pattern, &mut labels);
+                }
             }
         }
 
@@ -1031,9 +1034,11 @@ impl CypherQuery {
     pub fn referenced_relationship_types(&self) -> Vec<String> {
         let mut types = Vec::new();
 
-        for match_clause in &self.ast.match_clauses {
-            for pattern in &match_clause.patterns {
-                self.collect_relationship_types_from_pattern(pattern, &mut types);
+        for clause in &self.ast.reading_clauses {
+            if let ReadingClause::Match(match_clause) = clause {
+                for pattern in &match_clause.patterns {
+                    self.collect_relationship_types_from_pattern(pattern, &mut types);
+                }
             }
         }
 
@@ -1046,9 +1051,16 @@ impl CypherQuery {
     pub fn variables(&self) -> Vec<String> {
         let mut variables = Vec::new();
 
-        for match_clause in &self.ast.match_clauses {
-            for pattern in &match_clause.patterns {
-                self.collect_variables_from_pattern(pattern, &mut variables);
+        for clause in &self.ast.reading_clauses {
+            match clause {
+                ReadingClause::Match(match_clause) => {
+                    for pattern in &match_clause.patterns {
+                        self.collect_variables_from_pattern(pattern, &mut variables);
+                    }
+                }
+                ReadingClause::Unwind(unwind_clause) => {
+                    variables.push(unwind_clause.alias.clone());
+                }
             }
         }
 
@@ -1166,10 +1178,12 @@ impl CypherQuery {
         ctx: &datafusion::prelude::SessionContext,
     ) -> Result<Option<datafusion::dataframe::DataFrame>> {
         use crate::ast::GraphPattern;
-        let [mc] = self.ast.match_clauses.as_slice() else {
-            return Ok(None);
+        // Only support single MATCH clause for path execution
+
+        let match_clause = match self.ast.reading_clauses.as_slice() {
+            [ReadingClause::Match(mc)] => mc,
+            _ => return Ok(None),
         };
-        let match_clause = mc;
         let path = match match_clause.patterns.as_slice() {
             [GraphPattern::Path(p)] if !p.segments.is_empty() => p,
             _ => return Ok(None),
@@ -1340,12 +1354,16 @@ impl CypherQueryBuilder {
         }
 
         let ast = crate::ast::CypherQuery {
-            match_clauses: self.match_clauses,
+            reading_clauses: self
+                .match_clauses
+                .into_iter()
+                .map(crate::ast::ReadingClause::Match)
+                .collect(),
             where_clause: self
                 .where_expression
                 .map(|expr| crate::ast::WhereClause { expression: expr }),
             with_clause: None, // WITH not supported via builder yet
-            post_with_match_clauses: vec![],
+            post_with_reading_clauses: vec![],
             post_with_where_clause: None,
             return_clause: crate::ast::ReturnClause {
                 distinct: self.distinct,
