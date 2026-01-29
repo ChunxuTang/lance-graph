@@ -4508,6 +4508,42 @@ async fn test_with_post_match_chaining() {
 }
 
 // ============================================================================
+// Scalar Function / Semantic Validation Regression Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_unimplemented_scalar_function_errors() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new(
+        "MATCH (p:Person) RETURN p.name AS name, replace(p.name, 'A', 'a') AS replaced",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let err = query
+        .execute(datasets, Some(ExecutionStrategy::DataFusion))
+        .await
+        .expect_err("replace() should error until implemented");
+
+    let message = err.to_string().to_lowercase();
+    assert!(message.contains("replace"), "unexpected error: {err}");
+    assert!(
+        message.contains("not implemented") || message.contains("unsupported"),
+        "unexpected error: {err}"
+    );
+}
+
+// NOTE: Simple executor tests live in `tests/test_simple_executor_pipeline.rs`.
+
+// ============================================================================
 // UNWIND Tests
 // ============================================================================
 
