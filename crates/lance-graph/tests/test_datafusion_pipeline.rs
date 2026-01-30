@@ -2615,6 +2615,40 @@ async fn test_count_star_all_nodes() {
     assert_eq!(count_col.value(0), 5);
 }
 
+/// COUNT(DISTINCT *) is rejected at semantic validation because it's semantically meaningless.
+/// Without this check, it would return 1 (count of distinct lit(1) values) which is misleading.
+#[tokio::test]
+async fn test_count_distinct_star_rejected() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new("MATCH (a:Person) RETURN count(DISTINCT *) AS total")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query
+        .execute(datasets, Some(ExecutionStrategy::DataFusion))
+        .await;
+
+    // COUNT(DISTINCT *) should be rejected with a helpful error message
+    assert!(
+        result.is_err(),
+        "COUNT(DISTINCT *) should be rejected at semantic validation"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("COUNT(DISTINCT *)") || err_msg.contains("not supported"),
+        "Error should mention COUNT(DISTINCT *), got: {}",
+        err_msg
+    );
+}
+
 #[tokio::test]
 async fn test_count_variable() {
     let person_batch = create_person_dataset();
@@ -2824,6 +2858,169 @@ async fn test_count_property_without_alias_has_descriptive_name() {
         "Expected column named 'count(p.name)' but schema is: {:?}",
         result.schema()
     );
+}
+
+#[tokio::test]
+async fn test_count_distinct_basic() {
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+        .build()
+        .unwrap();
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), create_person_dataset());
+    datasets.insert("KNOWS".to_string(), create_knows_dataset());
+
+    // Test COUNT(DISTINCT source.id) - count unique people who know others
+    // KNOWS relationships: 1->2, 2->3, 3->4, 4->5, 1->3
+    // Unique source persons: 1, 2, 3, 4 (4 distinct)
+    let query = CypherQuery::new(
+        "MATCH (source:Person)-[:KNOWS]->(target:Person)
+         RETURN COUNT(DISTINCT source.id) AS num_people",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let result = query
+        .execute(datasets, Some(ExecutionStrategy::DataFusion))
+        .await
+        .unwrap();
+
+    // Verify results
+    assert_eq!(result.num_rows(), 1);
+
+    let num_people = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(num_people.value(0), 4); // 4 distinct source persons
+}
+
+#[tokio::test]
+async fn test_count_vs_count_distinct() {
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+        .build()
+        .unwrap();
+
+    // Test COUNT (non-distinct) - count all KNOWS relationships from person 1
+    // Person 1 has 2 KNOWS relationships: 1->2 and 1->3
+    {
+        let mut datasets = HashMap::new();
+        datasets.insert("Person".to_string(), create_person_dataset());
+        datasets.insert("KNOWS".to_string(), create_knows_dataset());
+
+        let query = CypherQuery::new(
+            "MATCH (source:Person)-[:KNOWS]->(target:Person)
+             WHERE source.id = 1
+             RETURN COUNT(target.id) AS total_connections",
+        )
+        .unwrap()
+        .with_config(config.clone());
+
+        let result = query
+            .execute(datasets, Some(ExecutionStrategy::DataFusion))
+            .await
+            .unwrap();
+
+        let count = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count.value(0), 2); // 2 connections (person 1 knows 2 people)
+    }
+
+    // Test COUNT(DISTINCT) - should count unique target persons (same as COUNT in this case)
+    {
+        let mut datasets = HashMap::new();
+        datasets.insert("Person".to_string(), create_person_dataset());
+        datasets.insert("KNOWS".to_string(), create_knows_dataset());
+
+        let query = CypherQuery::new(
+            "MATCH (source:Person)-[:KNOWS]->(target:Person)
+             WHERE source.id = 1
+             RETURN COUNT(DISTINCT target.id) AS unique_connections",
+        )
+        .unwrap()
+        .with_config(config);
+
+        let result = query
+            .execute(datasets, Some(ExecutionStrategy::DataFusion))
+            .await
+            .unwrap();
+
+        let count = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count.value(0), 2); // 2 unique target persons (2 and 3)
+    }
+}
+
+#[tokio::test]
+async fn test_count_distinct_with_grouping() {
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+        .build()
+        .unwrap();
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), create_person_dataset());
+    datasets.insert("KNOWS".to_string(), create_knows_dataset());
+
+    // Group by target person and count distinct sources who know them
+    // KNOWS relationships: 1->2, 2->3, 3->4, 4->5, 1->3
+    // Person 2 is known by: 1 (1 distinct)
+    // Person 3 is known by: 1, 2 (2 distinct)
+    // Person 4 is known by: 3 (1 distinct)
+    // Person 5 is known by: 4 (1 distinct)
+    let query = CypherQuery::new(
+        "MATCH (source:Person)-[:KNOWS]->(target:Person)
+         RETURN target.id AS target_id, COUNT(DISTINCT source.id) AS num_sources
+         ORDER BY target_id",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let result = query
+        .execute(datasets, Some(ExecutionStrategy::DataFusion))
+        .await
+        .unwrap();
+
+    assert_eq!(result.num_rows(), 4); // 4 different targets (2, 3, 4, 5)
+
+    let target_ids = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    // Person 2 is known by 1 person (person 1)
+    assert_eq!(target_ids.value(0), 2);
+    assert_eq!(counts.value(0), 1);
+
+    // Person 3 is known by 2 people (persons 1 and 2)
+    assert_eq!(target_ids.value(1), 3);
+    assert_eq!(counts.value(1), 2);
+
+    // Person 4 is known by 1 person (person 3)
+    assert_eq!(target_ids.value(2), 4);
+    assert_eq!(counts.value(2), 1);
+
+    // Person 5 is known by 1 person (person 4)
+    assert_eq!(target_ids.value(3), 5);
+    assert_eq!(counts.value(3), 1);
 }
 
 #[tokio::test]
@@ -4591,6 +4788,35 @@ async fn test_unwind_simple_list() {
     } else {
         panic!("Unexpected column type: {:?}", data_type);
     }
+}
+
+/// Test that COUNT(x) where x comes from UNWIND fails gracefully
+/// This documents a known limitation: COUNT(variable) assumes variable__id exists,
+/// but UNWIND-created variables don't have __id columns.
+#[tokio::test]
+async fn test_count_unwind_variable_known_limitation() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+
+    // COUNT(x) where x comes from UNWIND - x has no __id column
+    let query = CypherQuery::new("UNWIND [1, 2, 3] AS x RETURN COUNT(x)")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query
+        .execute(datasets, Some(ExecutionStrategy::DataFusion))
+        .await;
+
+    // This currently fails because COUNT(x) looks for x__id which doesn't exist
+    // If this starts passing in the future, update the test to verify correct count (3)
+    assert!(
+        result.is_err(),
+        "COUNT(unwind_variable) should fail - no __id column. If this passes, \
+         the limitation has been fixed and test should verify COUNT returns 3"
+    );
 }
 
 #[tokio::test]

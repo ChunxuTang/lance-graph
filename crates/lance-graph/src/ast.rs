@@ -316,10 +316,19 @@ pub enum ValueExpression {
     Property(PropertyRef),
     /// Literal value
     Literal(PropertyValue),
-    /// Function call
-    Function {
+    /// Scalar function call (toLower, upper, etc.)
+    /// These are row-level functions that operate on individual values
+    ScalarFunction {
         name: String,
         args: Vec<ValueExpression>,
+    },
+    /// Aggregate function call (COUNT, SUM, AVG, MIN, MAX, COLLECT)
+    /// These functions operate across multiple rows and support DISTINCT
+    AggregateFunction {
+        name: String,
+        args: Vec<ValueExpression>,
+        /// Whether DISTINCT keyword was specified (e.g., COUNT(DISTINCT x))
+        distinct: bool,
     },
     /// Arithmetic operation
     Arithmetic {
@@ -346,6 +355,27 @@ pub enum ValueExpression {
     /// Vector literal: [0.1, 0.2, 0.3]
     /// Represents an inline vector for similarity search
     VectorLiteral(Vec<f32>),
+}
+
+/// Function type classification
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionType {
+    /// Aggregate function (operates across multiple rows)
+    Aggregate,
+    /// Scalar function (operates on individual values)
+    Scalar,
+    /// Unknown function type
+    Unknown,
+}
+
+/// Classify a function by name
+pub fn classify_function(name: &str) -> FunctionType {
+    match name.to_lowercase().as_str() {
+        "count" | "sum" | "avg" | "min" | "max" | "collect" => FunctionType::Aggregate,
+        "tolower" | "lower" | "toupper" | "upper" => FunctionType::Scalar,
+        // Vector functions are handled separately as special variants
+        _ => FunctionType::Unknown,
+    }
 }
 
 /// Arithmetic operators

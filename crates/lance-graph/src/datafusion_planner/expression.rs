@@ -13,6 +13,7 @@ use datafusion::logical_expr::{col, lit, BinaryExpr, Expr, Operator};
 use datafusion_functions_aggregate::array_agg::array_agg;
 use datafusion_functions_aggregate::average::avg;
 use datafusion_functions_aggregate::count::count;
+use datafusion_functions_aggregate::count::count_distinct;
 use datafusion_functions_aggregate::min_max::max;
 use datafusion_functions_aggregate::min_max::min;
 use datafusion_functions_aggregate::sum::sum;
@@ -127,8 +128,37 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
             let qualified_name = format!("{}__{}", prop.variable, prop.property);
             col(&qualified_name)
         }
-        VE::Function { name, args } => {
-            // Handle aggregation functions
+        VE::ScalarFunction { name, args } => {
+            match name.to_lowercase().as_str() {
+                "tolower" | "lower" => {
+                    if args.len() == 1 {
+                        let arg_expr = to_df_value_expr(&args[0]);
+                        lower().call(vec![arg_expr])
+                    } else {
+                        // Invalid argument count - return NULL
+                        Expr::Literal(datafusion::scalar::ScalarValue::Null, None)
+                    }
+                }
+                "toupper" | "upper" => {
+                    if args.len() == 1 {
+                        let arg_expr = to_df_value_expr(&args[0]);
+                        upper().call(vec![arg_expr])
+                    } else {
+                        // Invalid argument count - return NULL
+                        Expr::Literal(datafusion::scalar::ScalarValue::Null, None)
+                    }
+                }
+                _ => {
+                    // Unknown scalar function - return NULL
+                    Expr::Literal(datafusion::scalar::ScalarValue::Null, None)
+                }
+            }
+        }
+        VE::AggregateFunction {
+            name,
+            args,
+            distinct,
+        } => {
             match name.to_lowercase().as_str() {
                 "count" => {
                     if args.len() == 1 {
@@ -140,6 +170,14 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
                                 // COUNT(p) - count non-NULL rows by using a representative column
                                 // Use <variable>__id as a null-sensitive column
                                 // This ensures optional matches with NULL variables are not counted
+                                //
+                                // LIMITATION: This assumes all bindings expose a <var>__id column.
+                                // This is true for ScanByLabel and Expand, but NOT for:
+                                // - UNWIND-created variables (e.g., UNWIND [1,2,3] AS x)
+                                // - WITH-projected aliases (e.g., WITH 1 AS x)
+                                // Those cases will produce a runtime "column not found" error.
+                                // TODO: Consider using COUNT(1) for non-node variables, or add
+                                // semantic validation to reject COUNT(variable) for non-node types.
                                 col(format!("{}__id", v))
                             }
                         } else {
@@ -147,8 +185,12 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
                             to_df_value_expr(&args[0])
                         };
 
-                        // Use DataFusion's count helper function
-                        count(arg_expr)
+                        // Use DataFusion's count or count_distinct
+                        if *distinct {
+                            count_distinct(arg_expr)
+                        } else {
+                            count(arg_expr)
+                        }
                     } else {
                         // Invalid argument count - return placeholder
                         lit(0)
@@ -156,12 +198,9 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
                 }
                 "sum" => {
                     if args.len() == 1 {
-                        // Note: SUM(variable) is rejected by semantic validation
-                        // So we only handle valid cases here
                         let arg_expr = to_df_value_expr(&args[0]);
                         sum(arg_expr)
                     } else {
-                        // Invalid argument count - return placeholder
                         lit(0)
                     }
                 }
@@ -189,7 +228,6 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
                         lit(0)
                     }
                 }
-                // COLLECT aggregation - collects values into an array
                 "collect" => {
                     if args.len() == 1 {
                         let arg_expr = to_df_value_expr(&args[0]);
@@ -198,27 +236,8 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
                         lit(0)
                     }
                 }
-                // String functions
-                "tolower" | "lower" => {
-                    if args.len() == 1 {
-                        let arg_expr = to_df_value_expr(&args[0]);
-                        lower().call(vec![arg_expr])
-                    } else {
-                        // Invalid argument count - return NULL
-                        Expr::Literal(datafusion::scalar::ScalarValue::Null, None)
-                    }
-                }
-                "toupper" | "upper" => {
-                    if args.len() == 1 {
-                        let arg_expr = to_df_value_expr(&args[0]);
-                        upper().call(vec![arg_expr])
-                    } else {
-                        // Invalid argument count - return NULL
-                        Expr::Literal(datafusion::scalar::ScalarValue::Null, None)
-                    }
-                }
                 _ => {
-                    // Unsupported function - return NULL which coerces to any type
+                    // Unsupported aggregate function - return NULL which coerces to any type
                     // This prevents type coercion errors in both string and numeric contexts
                     //
                     // TODO(#107): Now that semantic analysis rejects unknown functions, consider
@@ -317,15 +336,8 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
 pub(crate) fn contains_aggregate(expr: &ValueExpression) -> bool {
     use crate::ast::ValueExpression as VE;
     match expr {
-        VE::Function { name, args } => {
-            // Check if this is an aggregate function
-            let is_aggregate = matches!(
-                name.to_lowercase().as_str(),
-                "count" | "sum" | "avg" | "min" | "max" | "collect"
-            );
-            // Also check arguments recursively
-            is_aggregate || args.iter().any(contains_aggregate)
-        }
+        VE::AggregateFunction { .. } => true,
+        VE::ScalarFunction { args, .. } => args.iter().any(contains_aggregate),
         VE::Arithmetic { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         VE::VectorDistance { left, right, .. } => {
             contains_aggregate(left) || contains_aggregate(right)
@@ -357,15 +369,20 @@ pub(crate) fn to_cypher_column_name(expr: &ValueExpression) -> String {
             // Handle nested property references
             format!("{}.{}", prop.variable, prop.property)
         }
-        VE::Function { name, args } => {
-            // Generate descriptive function name: count(*), count(p.name), etc.
+        VE::ScalarFunction { name, args } | VE::AggregateFunction { name, args, .. } => {
+            let distinct_str = if let VE::AggregateFunction { distinct: true, .. } = expr {
+                "DISTINCT "
+            } else {
+                ""
+            };
+
             if args.len() == 1 {
                 let arg_repr = match &args[0] {
                     VE::Variable(v) => v.clone(),
                     VE::Property(prop) => format!("{}.{}", prop.variable, prop.property),
                     _ => "expr".to_string(),
                 };
-                format!("{}({})", name.to_lowercase(), arg_repr)
+                format!("{}({}{})", name.to_lowercase(), distinct_str, arg_repr)
             } else if args.is_empty() {
                 format!("{}()", name.to_lowercase())
             } else {
@@ -960,9 +977,10 @@ mod tests {
 
     #[test]
     fn test_value_expr_function_count_star() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "COUNT".into(),
             args: vec![ValueExpression::Literal(PropertyValue::String("*".into()))],
+            distinct: false,
         };
 
         let df_expr = to_df_value_expr(&expr);
@@ -975,12 +993,13 @@ mod tests {
 
     #[test]
     fn test_value_expr_function_count_property() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "COUNT".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "id".into(),
             })],
+            distinct: false,
         };
 
         let df_expr = to_df_value_expr(&expr);
@@ -994,12 +1013,13 @@ mod tests {
 
     #[test]
     fn test_value_expr_function_sum() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "SUM".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "amount".into(),
             })],
+            distinct: false,
         };
 
         let df_expr = to_df_value_expr(&expr);
@@ -1013,12 +1033,13 @@ mod tests {
 
     #[test]
     fn test_value_expr_function_avg() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "AVG".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "amount".into(),
             })],
+            distinct: false,
         };
 
         let df_expr = to_df_value_expr(&expr);
@@ -1032,12 +1053,13 @@ mod tests {
 
     #[test]
     fn test_value_expr_function_min() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "MIN".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "amount".into(),
             })],
+            distinct: false,
         };
 
         let df_expr = to_df_value_expr(&expr);
@@ -1051,12 +1073,13 @@ mod tests {
 
     #[test]
     fn test_value_expr_function_max() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "MAX".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "amount".into(),
             })],
+            distinct: false,
         };
 
         let df_expr = to_df_value_expr(&expr);
@@ -1070,7 +1093,7 @@ mod tests {
 
     #[test]
     fn test_value_expr_function_tolower() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "toLower".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
@@ -1091,7 +1114,7 @@ mod tests {
 
     #[test]
     fn test_value_expr_function_toupper() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "toUpper".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
@@ -1113,7 +1136,7 @@ mod tests {
     #[test]
     fn test_value_expr_function_lower_alias() {
         // Test that 'lower' also works (SQL-style alias)
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "lower".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
@@ -1133,7 +1156,7 @@ mod tests {
     #[test]
     fn test_value_expr_function_upper_alias() {
         // Test that 'upper' also works (SQL-style alias)
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "upper".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
@@ -1154,7 +1177,7 @@ mod tests {
     fn test_tolower_with_contains_produces_valid_like() {
         // This is the bug scenario: toLower(s.name) CONTAINS 'offer'
         // Previously returned lit(0) which caused type coercion error
-        let tolower_expr = ValueExpression::Function {
+        let tolower_expr = ValueExpression::ScalarFunction {
             name: "toLower".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "s".into(),
@@ -1194,9 +1217,10 @@ mod tests {
 
     #[test]
     fn test_contains_aggregate_count() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "COUNT".into(),
             args: vec![ValueExpression::Literal(PropertyValue::String("*".into()))],
+            distinct: false,
         };
 
         assert!(
@@ -1207,12 +1231,13 @@ mod tests {
 
     #[test]
     fn test_contains_aggregate_sum() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "SUM".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "value".into(),
             })],
+            distinct: false,
         };
 
         assert!(
@@ -1223,12 +1248,13 @@ mod tests {
 
     #[test]
     fn test_contains_aggregate_min() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "MIN".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "value".into(),
             })],
+            distinct: false,
         };
 
         assert!(
@@ -1239,12 +1265,13 @@ mod tests {
 
     #[test]
     fn test_contains_aggregate_max() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "MAX".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "value".into(),
             })],
+            distinct: false,
         };
 
         assert!(
@@ -1279,9 +1306,10 @@ mod tests {
     fn test_contains_aggregate_arithmetic_with_aggregate() {
         use crate::ast::ArithmeticOperator;
         let expr = ValueExpression::Arithmetic {
-            left: Box::new(ValueExpression::Function {
+            left: Box::new(ValueExpression::AggregateFunction {
                 name: "COUNT".into(),
                 args: vec![ValueExpression::Literal(PropertyValue::String("*".into()))],
+                distinct: false,
             }),
             operator: ArithmeticOperator::Multiply,
             right: Box::new(ValueExpression::Literal(PropertyValue::Integer(2))),
@@ -1313,11 +1341,12 @@ mod tests {
 
     #[test]
     fn test_contains_aggregate_nested_function() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "UPPER".into(),
-            args: vec![ValueExpression::Function {
+            args: vec![ValueExpression::AggregateFunction {
                 name: "COUNT".into(),
                 args: vec![ValueExpression::Literal(PropertyValue::String("*".into()))],
+                distinct: false,
             }],
         };
 
@@ -1344,9 +1373,10 @@ mod tests {
 
     #[test]
     fn test_cypher_column_name_function_count_star() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "COUNT".into(),
             args: vec![ValueExpression::Literal(PropertyValue::String("*".into()))],
+            distinct: false,
         };
 
         let name = to_cypher_column_name(&expr);
@@ -1360,12 +1390,13 @@ mod tests {
 
     #[test]
     fn test_cypher_column_name_function_count_property() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "COUNT".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "p".into(),
                 property: "id".into(),
             })],
+            distinct: false,
         };
 
         let name = to_cypher_column_name(&expr);
@@ -1374,12 +1405,13 @@ mod tests {
 
     #[test]
     fn test_cypher_column_name_function_sum() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "SUM".into(),
             args: vec![ValueExpression::Property(PropertyRef {
                 variable: "order".into(),
                 property: "amount".into(),
             })],
+            distinct: false,
         };
 
         let name = to_cypher_column_name(&expr);

@@ -601,6 +601,15 @@ fn function_call(input: &str) -> IResult<&str, ValueExpression> {
     let (input, _) = char('(')(input)?;
     let (input, _) = multispace0(input)?;
 
+    // Parse optional DISTINCT keyword
+    let (input, distinct) = opt(tag_no_case("DISTINCT"))(input)?;
+    let distinct = distinct.is_some();
+    let (input, _) = if distinct {
+        multispace1(input)?
+    } else {
+        (input, "")
+    };
+
     // Handle COUNT(*) special case - only allow * for COUNT function
     if let Ok((input_after_star, _)) = char::<_, nom::error::Error<&str>>('*')(input) {
         // Validate that this is COUNT function
@@ -609,9 +618,10 @@ fn function_call(input: &str) -> IResult<&str, ValueExpression> {
             let (input, _) = char(')')(input)?;
             return Ok((
                 input,
-                ValueExpression::Function {
+                ValueExpression::AggregateFunction {
                     name: name.to_string(),
                     args: vec![ValueExpression::Variable("*".to_string())],
+                    distinct,
                 },
             ));
         } else {
@@ -628,13 +638,51 @@ fn function_call(input: &str) -> IResult<&str, ValueExpression> {
     let (input, _) = multispace0(input)?;
     let (input, _) = char(')')(input)?;
 
-    Ok((
-        input,
-        ValueExpression::Function {
-            name: name.to_string(),
-            args,
-        },
-    ))
+    // Route based on function type
+    use crate::ast::{classify_function, FunctionType};
+    match classify_function(name) {
+        FunctionType::Aggregate => Ok((
+            input,
+            ValueExpression::AggregateFunction {
+                name: name.to_string(),
+                args,
+                distinct,
+            },
+        )),
+        FunctionType::Scalar => {
+            // Validate: reject DISTINCT on scalar functions at parse time
+            if distinct {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+            Ok((
+                input,
+                ValueExpression::ScalarFunction {
+                    name: name.to_string(),
+                    args,
+                },
+            ))
+        }
+        FunctionType::Unknown => {
+            // Default to ScalarFunction for unknown functions
+            // They'll be handled as NULL in expression conversion
+            if distinct {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+            Ok((
+                input,
+                ValueExpression::ScalarFunction {
+                    name: name.to_string(),
+                    args,
+                },
+            ))
+        }
+    }
 }
 
 fn value_expression_list(input: &str) -> IResult<&str, Vec<ValueExpression>> {
@@ -1241,7 +1289,7 @@ mod tests {
         assert_eq!(item.alias, Some("total".to_string()));
 
         match &item.expression {
-            ValueExpression::Function { name, args } => {
+            ValueExpression::AggregateFunction { name, args, .. } => {
                 assert_eq!(name, "count");
                 assert_eq!(args.len(), 1);
                 match &args[0] {
@@ -1249,7 +1297,7 @@ mod tests {
                     _ => panic!("Expected Variable(*) in count(*)"),
                 }
             }
-            _ => panic!("Expected Function expression"),
+            _ => panic!("Expected AggregateFunction expression"),
         }
     }
 
@@ -1262,7 +1310,7 @@ mod tests {
         let item = &result.return_clause.items[0];
 
         match &item.expression {
-            ValueExpression::Function { name, args } => {
+            ValueExpression::AggregateFunction { name, args, .. } => {
                 assert_eq!(name, "count");
                 assert_eq!(args.len(), 1);
                 match &args[0] {
@@ -1273,7 +1321,7 @@ mod tests {
                     _ => panic!("Expected Property in count(n.age)"),
                 }
             }
-            _ => panic!("Expected Function expression"),
+            _ => panic!("Expected AggregateFunction expression"),
         }
     }
 
@@ -1299,12 +1347,30 @@ mod tests {
         // Verify the AST structure
         let ast = result.unwrap();
         match &ast.return_clause.items[0].expression {
-            ValueExpression::Function { name, args } => {
+            ValueExpression::AggregateFunction { name, args, .. } => {
                 assert_eq!(name, "count");
                 assert_eq!(args.len(), 2);
             }
-            _ => panic!("Expected Function expression"),
+            _ => panic!("Expected AggregateFunction expression"),
         }
+    }
+
+    #[test]
+    fn test_parser_rejects_distinct_on_scalar() {
+        // Parser should reject DISTINCT on scalar functions at parse time
+        let query = "RETURN toLower(DISTINCT p.name)";
+        let result = parse_cypher_query(query);
+        assert!(
+            result.is_err(),
+            "Parser should reject DISTINCT on scalar functions"
+        );
+
+        let query2 = "RETURN upper(DISTINCT p.name)";
+        let result2 = parse_cypher_query(query2);
+        assert!(
+            result2.is_err(),
+            "Parser should reject DISTINCT on scalar functions"
+        );
     }
 
     #[test]

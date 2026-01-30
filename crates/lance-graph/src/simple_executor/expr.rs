@@ -169,7 +169,7 @@ pub(crate) fn to_df_value_expr_simple(
         VE::Property(prop) => col(&prop.property),
         VE::Variable(v) => col(v),
         VE::Literal(v) => to_df_literal(v),
-        VE::Function { name, args } => match name.to_lowercase().as_str() {
+        VE::ScalarFunction { name, args } => match name.to_lowercase().as_str() {
             "tolower" | "lower" => {
                 if args.len() == 1 {
                     lower().call(vec![to_df_value_expr_simple(&args[0])])
@@ -186,6 +186,10 @@ pub(crate) fn to_df_value_expr_simple(
             }
             _ => Expr::Literal(datafusion::scalar::ScalarValue::Null, None),
         },
+        VE::AggregateFunction { .. } => {
+            // Aggregates not supported in simple executor
+            Expr::Literal(datafusion::scalar::ScalarValue::Null, None)
+        }
         VE::Arithmetic {
             left,
             operator,
@@ -223,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_simple_expr_unknown_function_returns_null() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "replace".to_string(),
             args: vec![ValueExpression::Property(PropertyRef::new("p", "name"))],
         };
@@ -233,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_simple_expr_lower_wrong_arity_returns_null() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "lower".to_string(),
             args: vec![
                 ValueExpression::Property(PropertyRef::new("p", "name")),

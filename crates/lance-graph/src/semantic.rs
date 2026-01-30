@@ -357,13 +357,76 @@ impl SemanticAnalyzer {
                     });
                 }
             }
-            ValueExpression::Function { name, args } => {
+            ValueExpression::ScalarFunction { name, args } => {
                 let function_name = name.to_lowercase();
-
-                // Validate function-specific arity and signature rules
+                // Validate arity and known functions
                 match function_name.as_str() {
-                    // Aggregations
+                    "tolower" | "lower" | "toupper" | "upper" => {
+                        if args.len() != 1 {
+                            return Err(GraphError::PlanError {
+                                message: format!(
+                                    "{} requires exactly 1 argument, got {}",
+                                    name.to_uppercase(),
+                                    args.len()
+                                ),
+                                location: snafu::Location::new(file!(), line!(), column!()),
+                            });
+                        }
+                    }
+                    _ => {
+                        // Unknown scalar function - reject early with helpful error
+                        return Err(GraphError::UnsupportedFeature {
+                            feature: format!(
+                                "Cypher function '{}' is not implemented. Supported scalar functions: toLower, lower, toUpper, upper. Supported aggregate functions: COUNT, SUM, AVG, MIN, MAX, COLLECT.",
+                                name
+                            ),
+                            location: snafu::Location::new(file!(), line!(), column!()),
+                        });
+                    }
+                }
+
+                // Validate arguments recursively
+                for arg in args {
+                    self.analyze_value_expression(arg)?;
+                }
+            }
+            ValueExpression::AggregateFunction {
+                name,
+                args,
+                distinct,
+            } => {
+                let function_name = name.to_lowercase();
+                // Validate known aggregate functions
+                match function_name.as_str() {
                     "count" | "sum" | "avg" | "min" | "max" | "collect" => {
+                        // DISTINCT is only supported for COUNT
+                        // Other aggregates silently ignore it in execution, so reject early
+                        if *distinct && function_name != "count" {
+                            return Err(GraphError::UnsupportedFeature {
+                                feature: format!(
+                                    "DISTINCT is only supported with COUNT, not {}",
+                                    function_name.to_uppercase()
+                                ),
+                                location: snafu::Location::new(file!(), line!(), column!()),
+                            });
+                        }
+
+                        // COUNT(DISTINCT *) is semantically meaningless
+                        // It would count distinct values of lit(1) which is always 1
+                        if *distinct && function_name == "count" {
+                            if let Some(ValueExpression::Variable(v)) = args.first() {
+                                if v == "*" {
+                                    return Err(GraphError::PlanError {
+                                        message: "COUNT(DISTINCT *) is not supported. \
+                                            Use COUNT(*) to count all rows, or \
+                                            COUNT(DISTINCT property) to count distinct values."
+                                            .to_string(),
+                                        location: snafu::Location::new(file!(), line!(), column!()),
+                                    });
+                                }
+                            }
+                        }
+                        // All aggregates require exactly 1 argument
                         if args.len() != 1 {
                             return Err(GraphError::PlanError {
                                 message: format!(
@@ -389,25 +452,12 @@ impl SemanticAnalyzer {
                             }
                         }
                     }
-                    // Scalar string functions
-                    "tolower" | "lower" | "toupper" | "upper" => {
-                        if args.len() != 1 {
-                            return Err(GraphError::PlanError {
-                                message: format!(
-                                    "{} requires exactly 1 argument, got {}",
-                                    function_name.to_uppercase(),
-                                    args.len()
-                                ),
-                                location: snafu::Location::new(file!(), line!(), column!()),
-                            });
-                        }
-                    }
-                    // Unknown/unimplemented scalar function
                     _ => {
+                        // Unknown aggregate function - reject early
                         return Err(GraphError::UnsupportedFeature {
                             feature: format!(
-                                "Cypher function '{}' is not implemented",
-                                function_name
+                                "Cypher aggregate function '{}' is not implemented. Supported aggregate functions: COUNT, SUM, AVG, MIN, MAX, COLLECT.",
+                                name
                             ),
                             location: snafu::Location::new(file!(), line!(), column!()),
                         });
@@ -1087,7 +1137,7 @@ mod tests {
     #[test]
     fn test_function_argument_undefined_variable_in_return() {
         // RETURN toUpper(m.name)
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "toUpper".to_string(),
             args: vec![ValueExpression::Property(PropertyRef::new("m", "name"))],
         };
@@ -1101,7 +1151,7 @@ mod tests {
     #[test]
     fn test_function_argument_valid_variable_ok() {
         // MATCH (n:Person) RETURN toUpper(n.name)
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "toUpper".to_string(),
             args: vec![ValueExpression::Property(PropertyRef::new("n", "name"))],
         };
@@ -1142,12 +1192,13 @@ mod tests {
     #[test]
     fn test_count_with_multiple_args_fails_validation() {
         // COUNT(n.age, n.name) should fail semantic validation
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "count".to_string(),
             args: vec![
                 ValueExpression::Property(PropertyRef::new("n", "age")),
                 ValueExpression::Property(PropertyRef::new("n", "name")),
             ],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1163,9 +1214,10 @@ mod tests {
     #[test]
     fn test_count_with_zero_args_fails_validation() {
         // COUNT() with no arguments should fail
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "count".to_string(),
             args: vec![],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1181,9 +1233,10 @@ mod tests {
     #[test]
     fn test_count_with_one_arg_passes_validation() {
         // COUNT(n.age) should pass validation
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "count".to_string(),
             args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1199,9 +1252,10 @@ mod tests {
     #[test]
     fn test_count_star_passes_validation() {
         // COUNT(*) should be allowed (special-cased in semantic analysis)
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "count".to_string(),
             args: vec![ValueExpression::Variable("*".to_string())],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1213,11 +1267,12 @@ mod tests {
 
     #[test]
     fn test_unimplemented_scalar_function_fails_validation() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::ScalarFunction {
             name: "replace".to_string(),
             args: vec![ValueExpression::Property(PropertyRef::new("n", "name"))],
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        // ScalarFunction with unknown name collects an error
         assert!(
             result
                 .errors
@@ -1230,9 +1285,10 @@ mod tests {
 
     #[test]
     fn test_sum_with_variable_fails_validation() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "sum".to_string(),
             args: vec![ValueExpression::Variable("n".to_string())],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1252,9 +1308,10 @@ mod tests {
 
     #[test]
     fn test_avg_with_variable_fails_validation() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "avg".to_string(),
             args: vec![ValueExpression::Variable("n".to_string())],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1274,9 +1331,10 @@ mod tests {
 
     #[test]
     fn test_sum_with_property_passes_validation() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "sum".to_string(),
             args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1288,9 +1346,10 @@ mod tests {
 
     #[test]
     fn test_min_with_variable_fails_validation() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "min".to_string(),
             args: vec![ValueExpression::Variable("n".to_string())],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1310,9 +1369,10 @@ mod tests {
 
     #[test]
     fn test_max_with_variable_fails_validation() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "max".to_string(),
             args: vec![ValueExpression::Variable("n".to_string())],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1332,9 +1392,10 @@ mod tests {
 
     #[test]
     fn test_min_with_property_passes_validation() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "min".to_string(),
             args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
@@ -1346,14 +1407,69 @@ mod tests {
 
     #[test]
     fn test_max_with_property_passes_validation() {
-        let expr = ValueExpression::Function {
+        let expr = ValueExpression::AggregateFunction {
             name: "max".to_string(),
             args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+            distinct: false,
         };
         let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(
             result.errors.is_empty(),
             "MAX with property should pass validation, got errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_distinct_only_supported_on_count() {
+        // SUM(DISTINCT n.age) should fail - DISTINCT only supported for COUNT
+        let expr = ValueExpression::AggregateFunction {
+            name: "sum".to_string(),
+            args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+            distinct: true,
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("DISTINCT is only supported with COUNT")),
+            "Expected error about DISTINCT only for COUNT, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_count_distinct_star_rejected() {
+        // COUNT(DISTINCT *) is semantically meaningless - should be rejected
+        let expr = ValueExpression::AggregateFunction {
+            name: "count".to_string(),
+            args: vec![ValueExpression::Variable("*".to_string())],
+            distinct: true,
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("COUNT(DISTINCT *)")),
+            "Expected error about COUNT(DISTINCT *), got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_count_distinct_passes_validation() {
+        // COUNT(DISTINCT n.age) should pass
+        let expr = ValueExpression::AggregateFunction {
+            name: "count".to_string(),
+            args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+            distinct: true,
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "COUNT(DISTINCT) should pass validation, got errors: {:?}",
             result.errors
         );
     }

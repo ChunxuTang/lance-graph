@@ -88,9 +88,10 @@ mod tests {
         let project = LogicalOperator::Project {
             input: Box::new(scan),
             projections: vec![ProjectionItem {
-                expression: ValueExpression::Function {
+                expression: ValueExpression::AggregateFunction {
                     name: "count".to_string(),
                     args: vec![ValueExpression::Variable("*".to_string())],
+                    distinct: false,
                 },
                 alias: Some("total".to_string()),
             }],
@@ -114,9 +115,10 @@ mod tests {
         let project = LogicalOperator::Project {
             input: Box::new(scan),
             projections: vec![ProjectionItem {
-                expression: ValueExpression::Function {
+                expression: ValueExpression::AggregateFunction {
                     name: "count".to_string(),
                     args: vec![ValueExpression::Variable("*".to_string())],
+                    distinct: false,
                 },
                 alias: None,
             }],
