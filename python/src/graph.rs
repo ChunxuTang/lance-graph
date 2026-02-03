@@ -21,11 +21,14 @@ use arrow::compute::concat_batches;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
+use datafusion::datasource::{DefaultTableSource, MemTable};
+use datafusion::execution::context::SessionContext;
 use lance_graph::{
     ast::DistanceMetric as RustDistanceMetric, CypherQuery as RustCypherQuery,
     ExecutionStrategy as RustExecutionStrategy, GraphConfig as RustGraphConfig,
     GraphError as RustGraphError, VectorSearch as RustVectorSearch,
 };
+use lance_graph::source_catalog::InMemoryCatalog;
 use pyo3::{
     exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError},
     prelude::*,
@@ -873,6 +876,196 @@ fn record_batch_to_python_table(
     Ok(table.unbind())
 }
 
+/// Cypher query engine with cached catalog for efficient multi-query execution
+///
+/// This class provides a high-performance query execution interface by building
+/// the catalog and DataFusion context once, then reusing them across multiple queries.
+/// This avoids the cold-start penalty of rebuilding metadata structures on every query.
+///
+/// Use this class when you need to execute multiple queries against the same datasets.
+/// For single queries, the simpler `CypherQuery.execute()` API may be more convenient.
+///
+/// Implementation Details
+/// ----------------------
+/// - Each dataset is registered as both a node and relationship source in the catalog.
+///   The GraphConfig and query planner determine at runtime which interpretation to use
+///   based on the Cypher query pattern (e.g., (p:Person) vs -[:KNOWS]->).
+/// - SessionContext is internally Arc-wrapped, so cloning for each query is cheap
+///   (just incrementing refcounts, not copying state).
+///
+/// Examples
+/// --------
+/// >>> from lance_graph import CypherEngine, GraphConfig
+/// >>> import pyarrow as pa
+/// >>>
+/// >>> # Setup
+/// >>> config = GraphConfig.builder() \\
+/// ...     .with_node_label("Person", "id") \\
+/// ...     .with_relationship("KNOWS", "src_id", "dst_id") \\
+/// ...     .build()
+/// >>>
+/// >>> datasets = {
+/// ...     "Person": person_table,
+/// ...     "KNOWS": knows_table
+/// ... }
+/// >>>
+/// >>> # Create engine once
+/// >>> engine = CypherEngine(config, datasets)
+/// >>>
+/// >>> # Execute multiple queries efficiently
+/// >>> result1 = engine.execute("MATCH (p:Person) WHERE p.age > 30 RETURN p.name")
+/// >>> result2 = engine.execute("MATCH (p:Person)-[:KNOWS]->(f) RETURN p.name, f.name")
+/// >>> result3 = engine.execute("MATCH (p:Person) RETURN count(*)")
+#[pyclass(name = "CypherEngine", module = "lance.graph")]
+pub struct CypherEngine {
+    config: RustGraphConfig,
+    catalog: Arc<dyn lance_graph::source_catalog::GraphSourceCatalog>,
+    context: Arc<datafusion::execution::context::SessionContext>,
+}
+
+#[pymethods]
+impl CypherEngine {
+    /// Create a new CypherEngine with cached catalog
+    ///
+    /// This builds the catalog and DataFusion context once during initialization.
+    /// Subsequent queries will reuse these structures for better performance.
+    ///
+    /// Parameters
+    /// ----------
+    /// config : GraphConfig
+    ///     The graph configuration defining node labels and relationships
+    /// datasets : dict
+    ///     Dictionary mapping table names to Lance datasets or PyArrow tables
+    ///
+    /// Returns
+    /// -------
+    /// CypherEngine
+    ///     A new engine instance ready to execute queries
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If the configuration or datasets are invalid
+    /// RuntimeError
+    ///     If catalog building fails
+    #[new]
+    fn new(config: &GraphConfig, datasets: &Bound<'_, PyDict>) -> PyResult<Self> {
+        // Convert datasets to Arrow batches
+        let arrow_datasets = python_datasets_to_batches(datasets)?;
+
+        if arrow_datasets.is_empty() {
+            return Err(PyValueError::new_err("No input datasets provided"));
+        }
+
+        // Create session context and catalog
+        let ctx = SessionContext::new();
+        let mut catalog = InMemoryCatalog::new();
+
+        // Register all datasets as tables
+        for (name, batch) in &arrow_datasets {
+            let mem_table = Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create MemTable for {}: {}", name, e)))?,
+            );
+
+            // Register in session context for execution
+            let normalized_name = name.to_lowercase();
+            ctx.register_table(&normalized_name, mem_table.clone())
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to register table {}: {}", name, e)))?;
+
+            let table_source = Arc::new(DefaultTableSource::new(mem_table));
+
+            // Register as both node and relationship source with original name.
+            //
+            // This is intentional: lance-graph uses GraphConfig to determine at query-planning
+            // time whether a dataset should be treated as a node table or relationship table
+            // based on the Cypher query pattern (e.g., MATCH (p:Person) vs -[:KNOWS]->).
+            //
+            // By registering all datasets in both catalogs, we allow the planner to look up
+            // the correct source based on query context. This pattern matches the Rust 
+            // implementation in query.rs:build_catalog_and_context_from_datasets.
+            catalog = catalog
+                .with_node_source(name, table_source.clone())
+                .with_relationship_source(name, table_source);
+        }
+
+        Ok(Self {
+            config: config.inner.clone(),
+            catalog: Arc::new(catalog),
+            context: Arc::new(ctx),
+        })
+    }
+
+    /// Execute a Cypher query using the cached catalog
+    ///
+    /// This method reuses the catalog and context built during initialization,
+    /// avoiding the overhead of rebuilding metadata structures.
+    ///
+    /// Parameters
+    /// ----------
+    /// query : str
+    ///     The Cypher query string to execute
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.Table
+    ///     Query results as Arrow table
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If the query is invalid
+    /// RuntimeError
+    ///     If query execution fails
+    ///
+    /// Examples
+    /// --------
+    /// >>> result = engine.execute("MATCH (p:Person) WHERE p.age > 30 RETURN p.name")
+    /// >>> print(result.to_pandas())
+    fn execute(
+        &self,
+        py: Python,
+        query: &str,
+    ) -> PyResult<PyObject> {
+        // Parse the query
+        let cypher_query = RustCypherQuery::new(query)
+            .map_err(graph_error_to_pyerr)?
+            .with_config(self.config.clone());
+
+        // Execute using the cached catalog and context
+        // Note: SessionContext is internally Arc-wrapped, so clone() is cheap.
+        // We clone the SessionContext (not the Arc) because execute_with_catalog_and_context
+        // takes ownership. DataFusion's SessionContext::clone() just increments Arc refcounts
+        // for internal state (RuntimeEnv, SessionState), so this is a shallow clone.
+        let catalog = self.catalog.clone();
+        let context = self.context.as_ref().clone();
+
+        let result_batch = RT
+            .block_on(
+                Some(py),
+                cypher_query.execute_with_catalog_and_context(catalog, context),
+            )?
+            .map_err(graph_error_to_pyerr)?;
+
+        record_batch_to_python_table(py, &result_batch)
+    }
+
+    /// Get the graph configuration
+    fn config(&self) -> GraphConfig {
+        GraphConfig {
+            inner: self.config.clone(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CypherEngine(nodes={}, relationships={})",
+            self.config.node_mappings.len(),
+            self.config.relationship_mappings.len()
+        )
+    }
+}
+
 /// Register graph functionality with the Python module
 pub fn register_graph_module(py: Python, parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     let graph_module = PyModule::new(py, "graph")?;
@@ -882,6 +1075,7 @@ pub fn register_graph_module(py: Python, parent_module: &Bound<'_, PyModule>) ->
     graph_module.add_class::<GraphConfig>()?;
     graph_module.add_class::<GraphConfigBuilder>()?;
     graph_module.add_class::<CypherQuery>()?;
+    graph_module.add_class::<CypherEngine>()?;
     graph_module.add_class::<VectorSearch>()?;
     graph_module.add_class::<PyDirNamespace>()?;
 

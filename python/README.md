@@ -48,7 +48,41 @@ print(result.to_pylist())
 [{'p.name': 'Alice', 'c.name': 'London'}, {'p.name': 'Bob', 'c.name': 'Sydney'}]
 ```
 
-### 2. Build a Knowledge Graph from Text
+### 2. Multi-Query Execution with CypherEngine
+
+For executing multiple queries against the same datasets, use `CypherEngine` to cache the catalog and achieve better performance:
+
+```python
+import pyarrow as pa
+from lance_graph import CypherEngine, GraphConfig
+
+cfg = (
+    GraphConfig.builder()
+    .with_node_label("Person", "id")
+    .with_node_label("City", "id")
+    .with_relationship("lives_in", "src", "dst")
+    .build()
+)
+
+datasets = {
+    "Person": pa.table({"id": [1, 2], "name": ["Alice", "Bob"], "age": [30, 25]}),
+    "City": pa.table({"id": [10, 20], "name": ["London", "Sydney"]}),
+    "lives_in": pa.table({"src": [1, 2], "dst": [10, 20]}),
+}
+
+# Create engine once - builds catalog
+engine = CypherEngine(cfg, datasets)
+
+# Execute multiple queries efficiently - catalog is reused
+result1 = engine.execute("MATCH (p:Person) WHERE p.age > 25 RETURN p.name")
+result2 = engine.execute("MATCH (p:Person)-[:lives_in]->(c:City) RETURN p.name, c.name")
+result3 = engine.execute("MATCH (p:Person) RETURN count(*) as total")
+
+print(result1.to_pylist())
+# [{'p.name': 'Alice'}]
+```
+
+### 3. Build a Knowledge Graph from Text
 
 ```python
 from pathlib import Path
@@ -107,7 +141,7 @@ result = kg.query("""
 print(result.to_pylist())
 ```
 
-### 3. Natural Language Q&A
+### 4. Natural Language Q&A
 
 ```python
 from knowledge_graph.llm.qa import ask_question

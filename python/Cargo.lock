@@ -3459,6 +3459,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "datafusion",
  "futures",
  "lance-graph",
  "pyo3",
