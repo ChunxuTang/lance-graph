@@ -71,14 +71,19 @@ _bindings = _load_bindings()
 GraphConfig = _bindings.graph.GraphConfig
 GraphConfigBuilder = _bindings.graph.GraphConfigBuilder
 CypherQuery = _bindings.graph.CypherQuery
+CypherEngine = _bindings.graph.CypherEngine
+ExecutionStrategy = _bindings.graph.ExecutionStrategy
 VectorSearch = _bindings.graph.VectorSearch
 DistanceMetric = _bindings.graph.DistanceMetric
+
 DirNamespace = _bindings.graph.DirNamespace
 
 __all__ = [
     "GraphConfig",
     "GraphConfigBuilder",
     "CypherQuery",
+    "CypherEngine",
+    "ExecutionStrategy",
     "VectorSearch",
     "DistanceMetric",
     "DirNamespace",
