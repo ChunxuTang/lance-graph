@@ -3567,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "lance-graph"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "arrow",
  "arrow-array",
