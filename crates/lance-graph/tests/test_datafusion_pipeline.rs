@@ -4951,3 +4951,153 @@ async fn test_unwind_then_match() {
 
     assert_eq!(rows, expected);
 }
+
+// ===========================================================================
+// Variable Reuse Tests
+// ===========================================================================
+
+#[tokio::test]
+async fn test_datafusion_variable_reuse_with_count_distinct() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Test variable reuse: 'shared' appears in both patterns
+    // Simulates finding comments where creator is same as post creator
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(shared:Person), \
+               (shared)<-[:KNOWS]-(b:Person) \
+         RETURN COUNT(DISTINCT shared.id) AS count",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query
+        .execute(datasets, Some(ExecutionStrategy::DataFusion))
+        .await
+        .unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+
+    let counts = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    // Distinct people who have at least 2 people knowing them:
+    // Bob (known by Alice), Charlie (known by Alice and Bob),
+    // David (known by Charlie), Eve (known by David) = 4 people
+    assert_eq!(counts.value(0), 4);
+}
+
+#[tokio::test]
+async fn test_datafusion_variable_reuse_triangle_pattern() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Test multiple variable reuses: a, b, c all reused across 3 patterns
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person), \
+               (b)-[:KNOWS]->(c:Person), \
+               (a)-[:KNOWS]->(c) \
+         RETURN a.name, b.name, c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query
+        .execute(datasets, Some(ExecutionStrategy::DataFusion))
+        .await
+        .unwrap();
+
+    // Edges: 1->2, 2->3, 3->4, 4->5, 1->3
+    // Triangle: Alice->Bob->Charlie with Alice->Charlie shortcut
+    assert_eq!(result.num_rows(), 1);
+
+    let a_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let c_names = result
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(a_names.value(0), "Alice");
+    assert_eq!(b_names.value(0), "Bob");
+    assert_eq!(c_names.value(0), "Charlie");
+}
+
+#[tokio::test]
+async fn test_datafusion_variable_reuse_multi_pattern_optimization() {
+    // Pattern structure: (x)-[:R1]->(shared), (x)-[:R2]->(y)-[:R3]->(shared)
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    // Query finds Alice(1) who knows Bob(2), and Alice(1) knows someone(2) who knows same Bob(3)?
+    let query = CypherQuery::new(
+        "MATCH (p:Person)-[:KNOWS]->(friend:Person), \
+               (p)-[:KNOWS]->(other:Person)-[:KNOWS]->(friend) \
+         RETURN p.name, friend.name",
+    )
+    .unwrap()
+    .with_config(config.clone());
+
+    let result = query
+        .execute(datasets.clone(), Some(ExecutionStrategy::DataFusion))
+        .await
+        .unwrap();
+
+    // Alice(1) knows Charlie(3), and Alice(1) knows Bob(2) who knows Charlie(3)
+    assert_eq!(result.num_rows(), 1);
+
+    let p_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let friend_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(p_names.value(0), "Alice");
+    assert_eq!(friend_names.value(0), "Charlie");
+
+    // Verify the query plan is optimal - 'p' and 'friend' should not be scanned twice
+    let explain_output = query.explain(datasets).await.unwrap();
+    let plan_str = format!("{:?}", explain_output);
+    let person_scan_count = plan_str.matches("TableScan: person").count();
+
+    // Without optimization: would be 4 scans (p, friend, p again, friend again)
+    // With optimization: should be 3 scans (p, friend, other - reusing p and friend)
+    assert_eq!(
+        person_scan_count, 3,
+        "Expected optimal plan with 3 Person scans (p, friend, other), got {}. \
+         Without optimization would be 4 (duplicate p and friend).",
+        person_scan_count
+    );
+}

@@ -338,13 +338,18 @@ impl LogicalPlanner {
             .clone()
             .unwrap_or_else(|| format!("_node_{}", self.variables.len()));
 
-        let label = node
-            .labels
-            .first()
+        // Validate label consistency if variable already exists
+        self.validate_variable_label(&variable, &node.labels)?;
+
+        // Reuse existing label or derive from AST (default to "Node")
+        let label = self
+            .variables
+            .get(&variable)
             .cloned()
+            .or_else(|| node.labels.first().cloned())
             .unwrap_or_else(|| "Node".to_string());
 
-        // Register variable
+        // Register variable with its label
         self.variables.insert(variable.clone(), label.clone());
 
         Ok(LogicalOperator::ScanByLabel {
@@ -354,7 +359,25 @@ impl LogicalPlanner {
         })
     }
 
-    // (removed) plan_path_segment is superseded by plan_path
+    /// Validate that a node's explicit label (if any) matches the already-registered
+    /// label for this variable. Returns `Ok(())` if the variable is new or if labels
+    /// are consistent, and an error if they conflict.
+    fn validate_variable_label(&self, variable: &str, ast_labels: &[String]) -> Result<()> {
+        if let Some(existing_label) = self.variables.get(variable) {
+            if let Some(ast_label) = ast_labels.first() {
+                if ast_label != existing_label {
+                    return Err(GraphError::PlanError {
+                        message: format!(
+                            "Variable '{}' already has label '{}', cannot redefine as '{}'",
+                            variable, existing_label, ast_label
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Plan a full path pattern, respecting the starting variable if provided
     fn plan_path(
@@ -375,6 +398,11 @@ impl LogicalPlanner {
             None => self.extract_variable_from_plan(&plan)?,
         };
 
+        // Validate start node label consistency if variable already exists
+        if let Some(start_var) = &path.start_node.variable {
+            self.validate_variable_label(start_var, &path.start_node.labels)?;
+        }
+
         // For each segment, add an expand
         for segment in &path.segments {
             // Determine / register target variable
@@ -384,12 +412,17 @@ impl LogicalPlanner {
                 .clone()
                 .unwrap_or_else(|| format!("_node_{}", self.variables.len()));
 
-            let target_label = segment
-                .end_node
-                .labels
-                .first()
+            // Validate label consistency for already-registered variables
+            self.validate_variable_label(&target_variable, &segment.end_node.labels)?;
+
+            // Reuse existing label or derive from AST (default to "Node")
+            let target_label = self
+                .variables
+                .get(&target_variable)
                 .cloned()
+                .or_else(|| segment.end_node.labels.first().cloned())
                 .unwrap_or_else(|| "Node".to_string());
+
             self.variables
                 .insert(target_variable.clone(), target_label.clone());
 
@@ -1170,5 +1203,62 @@ mod tests {
             },
             _ => panic!("Expected Project at top level"),
         }
+    }
+
+    #[test]
+    fn test_variable_reuse_across_patterns() {
+        let query_text =
+            "MATCH (a:Person)-[:KNOWS]->(shared:Person), (shared)-[:KNOWS]->(b:Person) RETURN b.name";
+
+        let ast = parse_cypher_query(query_text).unwrap();
+        let mut planner = LogicalPlanner::new();
+        let logical_plan = planner.plan(&ast).unwrap();
+
+        // Expect: Project { Expand(shared->b) { Expand(a->shared) { Scan(a) } } }
+        match &logical_plan {
+            LogicalOperator::Project { input, .. } => match input.as_ref() {
+                LogicalOperator::Expand {
+                    input: inner,
+                    source_variable,
+                    target_variable,
+                    ..
+                } => {
+                    assert_eq!(source_variable, "shared");
+                    assert_eq!(target_variable, "b");
+
+                    match inner.as_ref() {
+                        LogicalOperator::Expand {
+                            source_variable: first_src,
+                            target_variable: first_dst,
+                            ..
+                        } => {
+                            assert_eq!(first_src, "a");
+                            assert_eq!(first_dst, "shared");
+                        }
+                        _ => panic!("Expected first Expand (a->shared)"),
+                    }
+                }
+                _ => panic!("Expected second Expand (shared->b)"),
+            },
+            _ => panic!("Expected Project at top level"),
+        }
+    }
+
+    #[test]
+    fn test_variable_reuse_with_conflicting_labels() {
+        let query_text =
+            "MATCH (a:Person)-[:KNOWS]->(shared:Person), (shared:Company)-[:EMPLOYS]->(b:Person) RETURN b.name";
+
+        let ast = parse_cypher_query(query_text).unwrap();
+        let mut planner = LogicalPlanner::new();
+        let err = planner.plan(&ast).unwrap_err();
+        let err_msg = err.to_string();
+
+        assert!(
+            err_msg.contains("already has label 'Person'")
+                && err_msg.contains("cannot redefine as 'Company'"),
+            "Expected error about label conflict, got: {}",
+            err_msg
+        );
     }
 }
