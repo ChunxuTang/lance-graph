@@ -47,6 +47,7 @@ pub mod parameter_substitution;
 pub mod parser;
 pub mod query;
 pub mod semantic;
+pub mod spark_dialect;
 pub mod sql_catalog;
 pub mod sql_query;
 pub mod table_readers;
@@ -67,7 +68,7 @@ pub use lance_graph_catalog::{
 #[cfg(feature = "unity-catalog")]
 pub use lance_graph_catalog::{UnityCatalogConfig, UnityCatalogProvider};
 pub use lance_vector_search::VectorSearch;
-pub use query::{CypherQuery, ExecutionStrategy};
+pub use query::{CypherQuery, ExecutionStrategy, SqlDialect};
 pub use sql_query::SqlQuery;
 #[cfg(feature = "delta")]
 pub use table_readers::DeltaTableReader;
